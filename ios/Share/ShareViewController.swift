@@ -26,6 +26,7 @@ final class ShareViewController: UIViewController {
     private var total: Int64 = 0
     private var sent: Int64 = 0
     private var finished = false
+    private var lastProgress = Date() // q: when bytes last went (a stall ends it with a message)
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -39,13 +40,13 @@ final class ShareViewController: UIViewController {
         icon.contentMode = .scaleAspectFit
         title_.font = .preferredFont(forTextStyle: .headline)
         title_.textColor = .white
-        title_.text = "Send to Computer"
+        title_.text = tr("Send to Computer")
         detail.font = .preferredFont(forTextStyle: .subheadline)
         detail.textColor = UIColor(white: 1, alpha: 0.6)
         detail.numberOfLines = 0
-        detail.text = "Getting the items ready…"
+        detail.text = tr("Getting the items ready…")
         bar.progressTintColor = icon.tintColor
-        button.setTitle("Cancel", for: .normal)
+        button.setTitle(tr("Cancel"), for: .normal)
         button.titleLabel?.font = .preferredFont(forTextStyle: .body)
         button.addTarget(self, action: #selector(close), for: .touchUpInside)
         let stack = UIStackView(arrangedSubviews: [icon, title_, detail, bar, button])
@@ -82,7 +83,7 @@ final class ShareViewController: UIViewController {
             if done {
                 self.finished = true
                 self.bar.isHidden = true
-                self.button.setTitle("Done", for: .normal)
+                self.button.setTitle(tr("Done"), for: .normal)
             }
         }
     }
@@ -97,7 +98,9 @@ final class ShareViewController: UIViewController {
         try? FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
         for (i, p) in providers.enumerated() {
             g.enter()
-            let isFile = p.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
+            // A photo or video is always the file (Photos' items can say URL too).
+            let media = p.hasItemConformingToTypeIdentifier(UTType.image.identifier) || p.hasItemConformingToTypeIdentifier(UTType.audiovisualContent.identifier)
+            let isFile = media || p.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
             if !isFile, p.hasItemConformingToTypeIdentifier(UTType.url.identifier) {
                 p.loadItem(forTypeIdentifier: UTType.url.identifier) { v, _ in
                     if let u = v as? URL { out[i] = .text(u.absoluteString) }
@@ -112,23 +115,42 @@ final class ShareViewController: UIViewController {
                 }
                 continue
             }
-            // A file: its own type first (a photo as the photo, not a converted copy).
-            let type = p.registeredTypeIdentifiers.first { id in
-                guard let t = UTType(id) else { return false }
-                return t.conforms(to: .data) || t.conforms(to: .package)
-            } ?? UTType.data.identifier
+            // A file: its own type first (a photo as the photo, not a converted copy). Photos lists
+            // private types too (a Live Photo's bundle, thumbnails): those give a folder or nothing,
+            // so a public image or video type comes first, then any other file type.
+            let ids = p.registeredTypeIdentifiers
+            let usable = ids.filter { !$0.hasPrefix("com.apple.private") && $0 != "com.apple.live-photo-bundle" }
+            func pick(_ ok: (UTType) -> Bool) -> String? { usable.first { UTType($0).map(ok) ?? false } }
+            let type = pick { $0.conforms(to: .image) || $0.conforms(to: .movie) || $0.conforms(to: .audiovisualContent) }
+                ?? pick { $0.conforms(to: .data) && !$0.conforms(to: .directory) }
+                ?? (p.hasItemConformingToTypeIdentifier(UTType.image.identifier) ? UTType.image.identifier : UTType.data.identifier)
+            let dir = tmp.appendingPathComponent(String(i), isDirectory: true)
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let suggested = p.suggestedName ?? ""
+            func named(_ ext: String, _ fallback: String) -> URL {
+                var name = suggested.isEmpty ? fallback : suggested
+                if !ext.isEmpty, !name.lowercased().hasSuffix("." + ext.lowercased()) { name = "\(name).\(ext)" }
+                return dir.appendingPathComponent(name.replacingOccurrences(of: "/", with: "_"))
+            }
+            let ext = UTType(type)?.preferredFilenameExtension ?? ""
             p.loadFileRepresentation(forTypeIdentifier: type) { url, _ in
-                defer { g.leave() }
-                guard let url = url else { return }
-                var name = url.lastPathComponent
-                if let s = p.suggestedName, !s.isEmpty {
-                    let ext = url.pathExtension
-                    name = ext.isEmpty || s.lowercased().hasSuffix("." + ext.lowercased()) ? s : "\(s).\(ext)"
+                if let url = url, !((try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false) {
+                    let dest = suggested.isEmpty ? dir.appendingPathComponent(url.lastPathComponent) : named(url.pathExtension, url.lastPathComponent)
+                    if (try? FileManager.default.copyItem(at: url, to: dest)) != nil { out[i] = .file(dest, dest.lastPathComponent); g.leave(); return }
                 }
-                let dir = tmp.appendingPathComponent(String(i), isDirectory: true)
-                try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-                let dest = dir.appendingPathComponent(name.replacingOccurrences(of: "/", with: "_"))
-                if (try? FileManager.default.copyItem(at: url, to: dest)) != nil { out[i] = .file(dest, dest.lastPathComponent) }
+                // No file for it: what the item gives as such (a URL, its bytes or a picture).
+                p.loadItem(forTypeIdentifier: type) { v, _ in
+                    defer { g.leave() }
+                    let dest = named(ext, "Shared item")
+                    if let u = v as? URL, u.isFileURL, case let d = named(u.pathExtension, u.lastPathComponent), (try? FileManager.default.copyItem(at: u, to: d)) != nil {
+                        out[i] = .file(d, d.lastPathComponent)
+                    } else if let d = v as? Data, (try? d.write(to: dest)) != nil {
+                        out[i] = .file(dest, dest.lastPathComponent)
+                    } else if let img = v as? UIImage, let d = img.jpegData(compressionQuality: 0.92) {
+                        let j = named("jpg", "Photo")
+                        if (try? d.write(to: j)) != nil { out[i] = .file(j, j.lastPathComponent) }
+                    }
+                }
             }
         }
         g.notify(queue: .main) { done(out.compactMap { $0 }) }
@@ -137,7 +159,7 @@ final class ShareViewController: UIViewController {
     // ---- to the app ----
 
     private func deliver(_ items: [Item]) {
-        if items.isEmpty { return show("Nothing to send", "TwinDesk couldn’t read what was shared.", done: true) }
+        if items.isEmpty { return show(tr("Nothing to send"), tr("TwinDesk couldn’t read what was shared."), done: true) }
         for it in items { if case .file(let u, _) = it { total += Int64((try? u.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) } }
         let c = NWConnection(host: "127.0.0.1", port: 47831, using: .tcp)
         conn = c
@@ -153,8 +175,8 @@ final class ShareViewController: UIViewController {
                     guard let o = o, o["ok"] as? Bool == true else { return self.notRunning() }
                     let to = (o["to"] as? String) ?? ""
                     let on = o["connected"] as? Bool == true
-                    self.show(on ? "Sending to \(to.isEmpty ? "the computer" : to)" : "Send to Computer",
-                              on ? self.summary(items) : "TwinDesk isn’t connected: they go when it is.")
+                    self.show(on ? tr("Sending to {name}", ["name": to.isEmpty ? tr("the computer") : to]) : tr("Send to Computer"),
+                              on ? self.summary(items) : tr("TwinDesk isn’t connected: they go when it is."))
                     self.send(items, 0)
                 }
             case .failed, .waiting: if !started { started = true; self.notRunning() }
@@ -168,14 +190,14 @@ final class ShareViewController: UIViewController {
         let files = items.filter { if case .file = $0 { return true }; return false }.count
         let texts = items.count - files
         var parts: [String] = []
-        if files > 0 { parts.append(files == 1 ? "1 file" : "\(files) files") }
-        if texts > 0 { parts.append("text to its clipboard") }
+        if files > 0 { parts.append(files == 1 ? tr("1 file") : tr("{files} files", ["files": files])) }
+        if texts > 0 { parts.append(tr("text to its clipboard")) }
         return parts.joined(separator: " and ")
     }
 
     private func notRunning() {
         conn?.cancel()
-        show("TwinDesk isn’t running", "Open TwinDesk, then share again. With Stay connected on (General) it keeps running in the background and this works from anywhere.", done: true)
+        show(tr("TwinDesk isn’t running"), tr("Open TwinDesk, then share again. With Stay connected on (General) it keeps running in the background and this works from anywhere."), done: true)
     }
 
     private func line(_ o: [String: Any]) {
@@ -189,8 +211,8 @@ final class ShareViewController: UIViewController {
             line(["t": "end"])
             return readLine(timeout: 30) { o in
                 let on = o?["sent"] as? Bool == true
-                self.show(o == nil ? "Something went wrong" : on ? "Sent" : "Waiting to send",
-                          o == nil ? "TwinDesk stopped answering." : on ? "It’s on its way to the computer." : "TwinDesk sends them once it’s connected.", done: true)
+                self.show(o == nil ? tr("Something went wrong") : on ? tr("Sent") : tr("Waiting to send"),
+                          o == nil ? tr("TwinDesk stopped answering.") : on ? tr("It’s on its way to the computer.") : tr("TwinDesk sends them once it’s connected."), done: true)
                 if o != nil { DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) { self.close() } }
             }
         }
@@ -202,6 +224,8 @@ final class ShareViewController: UIViewController {
             let size = Int64((try? u.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
             guard let fh = try? FileHandle(forReadingFrom: u) else { return send(items, i + 1) }
             line(["t": "file", "name": name, "size": size])
+            lastProgress = Date()
+            watchStall()
             var left = size
             func pump() {
                 if left <= 0 { try? fh.close(); try? FileManager.default.removeItem(at: u); return send(items, i + 1) }
@@ -211,8 +235,9 @@ final class ShareViewController: UIViewController {
                 left -= Int64(n)
                 conn?.send(content: d, completion: .contentProcessed { [weak self] e in
                     guard let self = self else { return }
-                    if e != nil { return self.show("Something went wrong", "TwinDesk stopped answering.", done: true) }
+                    if e != nil { return self.show(tr("Something went wrong"), tr("TwinDesk stopped answering."), done: true) }
                     self.sent += Int64(n)
+                    self.lastProgress = Date()
                     let p = self.total > 0 ? Float(Double(self.sent) / Double(self.total)) : 0
                     DispatchQueue.main.async { self.bar.setProgress(p, animated: true) }
                     pump()
@@ -220,6 +245,24 @@ final class ShareViewController: UIViewController {
             }
             pump()
         }
+    }
+
+    // TwinDesk stopped taking the bytes (iOS suspended it behind this app): said, not waited on forever.
+    private var watching = false
+    private func watchStall() {
+        if watching { return }
+        watching = true
+        func check() {
+            q.asyncAfter(deadline: .now() + 2) { [weak self] in
+                guard let self = self, !self.finished else { return }
+                if Date().timeIntervalSince(self.lastProgress) > 20 {
+                    self.conn?.cancel()
+                    return self.show(tr("TwinDesk stopped answering"), tr("iOS paused it in the background. Open TwinDesk, then share again."), done: true)
+                }
+                check()
+            }
+        }
+        check()
     }
 
     private func readLine(timeout: TimeInterval, _ done: @escaping ([String: Any]?) -> Void) {

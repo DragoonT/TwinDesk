@@ -11,11 +11,20 @@
 // "You copied something — Send to <computer>". Its button opens TwinDesk for a moment and sends
 // it. With TwinDesk in front, a copy goes at once. The Send Clipboard shortcut (Back Tap, the
 // Action button) does the same from anywhere.
+//
+// No loops: what TwinDesk writes carries its own type (Clip.mark) and stays on this device
+// (localOnly: Universal Clipboard doesn't carry it back to a Mac on the same Apple Account), and a
+// clipboard holding TwinDesk's own copy is never read or sent. Universal Clipboard still echoes
+// what goes between this device and a Mac (the Mac's copy reaching here on its own too; ours,
+// written there, coming back): with a Mac only, after each copy either way, the one change that echo makes isn't read (no "Allow
+// Paste" for something already on both). Seen once, it's expected for 15 s after each copy; never
+// seen (Universal Clipboard off, another Apple Account), nothing is skipped past the first 5 s.
 import Foundation
 import UIKit
+import UniformTypeIdentifiers
 
 final class Clip: Feature {
-    struct Item: Identifiable { let id = UUID(); let dir: String; let text: String; let at = Date() }
+    struct Item: Identifiable { let id = UUID(); let dir: String; let text: String; var pic = false; let at = Date() }
 
     private(set) var peerAccepts = false
     private(set) var peerImages = false
@@ -24,13 +33,24 @@ final class Clip: Feature {
     private var lastOut: String?
     private var ownCount = -1 // the change count right after we wrote the clipboard ourselves
     private var seenCount = UIPasteboard.general.changeCount
+    private var echoUntil = Date.distantPast // one Universal Clipboard echo expected until then
+    private var ucEchoes: Bool { core.store.flag("clip.ucEcho", false) }
+
+    // A copy went between the two: its echo (one change) is expected.
+    // Only with a Mac: Universal Clipboard is Apple's, a Windows or Linux computer never echoes, so
+    // with those nothing is ever skipped.
+    private func expectEcho() {
+        guard (core.link.host?.os ?? "") == "mac" else { echoUntil = .distantPast; return }
+        echoUntil = Date().addingTimeInterval(ucEchoes ? 15 : 5)
+    }
+    static let mark = "com.twindesk.clip" // on everything TwinDesk writes to the clipboard
     private var watch: Timer?
     private var pic: (id: String, w: Int, h: Int, bytes: Int, parts: Int, got: Int, data: Data, at: Date)?
 
     var autoCopy: Bool { core.store.flag("clip.auto", true) }
     var notify: Bool { core.store.flag("clip.notify", true) }
     var notifyOwn: Bool { core.store.flag("clip.notifyOwn", true) }
-    var pictures: Bool { core.store.flag("clip.images", true) }
+    var pictures: Bool { core.store.flag("clip.images", false) }
 
     func setOption(_ key: String, _ on: Bool) {
         core.store.setFlag(key, on)
@@ -76,6 +96,7 @@ final class Clip: Feature {
 
     func receiveText(_ text: String) {
         lastIn = text
+        expectEcho()
         remember(Item(dir: "in", text: text))
         if autoCopy || UIApplication.shared.applicationState == .active { write(text) }
         if notify && UIApplication.shared.applicationState != .active {
@@ -85,16 +106,25 @@ final class Clip: Feature {
 
     // From the notification's Copy button, or a Recent item.
     func write(_ text: String) {
-        UIPasteboard.general.string = text
+        put([UTType.utf8PlainText.identifier: text])
+    }
+
+    private func writeImage(_ img: UIImage) {
+        guard let png = img.pngData() else { return }
+        put([UTType.png.identifier: png])
+    }
+
+    // Ours: marked, and only on this device (no Universal Clipboard round trip back to the computer).
+    private func put(_ item: [String: Any]) {
+        var item = item
+        item[Self.mark] = Data("1".utf8)
+        UIPasteboard.general.setItems([item], options: [.localOnly: true])
         ownCount = UIPasteboard.general.changeCount
         seenCount = ownCount
     }
 
-    private func writeImage(_ img: UIImage) {
-        UIPasteboard.general.image = img
-        ownCount = UIPasteboard.general.changeCount
-        seenCount = ownCount
-    }
+    // TwinDesk's own copy is on the clipboard (checking types needs no permission, no prompt).
+    var ownOnBoard: Bool { UIPasteboard.general.contains(pasteboardTypes: [Self.mark]) }
 
     private func header(_ m: JSON) {
         pic = nil
@@ -125,10 +155,11 @@ final class Clip: Feature {
 
     private func receivePicture(_ png: Data, _ w: Int, _ h: Int) {
         guard let img = UIImage(data: png) else { return }
-        remember(Item(dir: "in", text: "Picture · \(w) × \(h)"))
+        expectEcho()
+        remember(Item(dir: "in", text: tr("Picture · {w} × {h}", ["w": w, "h": h]), pic: true))
         writeImage(img)
         if notify && UIApplication.shared.applicationState != .active {
-            Notifier.shared.clipIn("Picture · \(w) × \(h)", from: core.link.host?.name ?? "Computer", copied: true)
+            Notifier.shared.clipIn(tr("Picture · {w} × {h}", ["w": w, "h": h]), from: core.link.host?.name ?? "Computer", copied: true)
         }
     }
 
@@ -138,6 +169,7 @@ final class Clip: Feature {
     private func startWatching() {
         if watch != nil { return }
         watch = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.check() }
+        watch?.tolerance = 0.5 // iOS may fold it into other wakeups (battery)
     }
 
     func appBecameActive() { check() }
@@ -146,12 +178,18 @@ final class Clip: Feature {
         let n = UIPasteboard.general.changeCount
         guard n != seenCount else { return }
         seenCount = n
-        guard n != ownCount, core.connected, core.sync.get("clipboard", "out") else { return }
+        guard n != ownCount, !ownOnBoard, core.connected, core.sync.get("clipboard", "out") else { return }
+        // The copy that just went between the two, through Universal Clipboard: not read (it would ask to paste).
+        if Date() < echoUntil {
+            echoUntil = .distantPast
+            if !ucEchoes { core.store.setFlag("clip.ucEcho", true) }
+            return
+        }
         if UIApplication.shared.applicationState == .active {
             sendCurrent(force: false)
         } else if notifyOwn {
             let hasImage = UIPasteboard.general.hasImages
-            Notifier.shared.clipOut(to: core.link.host?.name ?? "the computer", picture: hasImage)
+            Notifier.shared.clipOut(to: core.link.host?.name ?? tr("the computer"), picture: hasImage)
         }
     }
 
@@ -159,6 +197,7 @@ final class Clip: Feature {
     @discardableResult
     func sendCurrent(force: Bool = true) -> Bool {
         let pb = UIPasteboard.general
+        if !force && ownOnBoard { return false } // TwinDesk's own copy: nothing new
         if pb.hasStrings, let text = pb.string { return sendText(text, force: force) }
         if pb.hasImages, let img = pb.image { return sendPicture(img) }
         return false
@@ -169,6 +208,7 @@ final class Clip: Feature {
         guard core.connected, !text.isEmpty, text.utf8.count <= Proto.clipMaxBytes else { return false }
         if !force && (text == lastOut || text == lastIn) { return false }
         lastOut = text
+        expectEcho()
         remember(Item(dir: "out", text: text))
         return core.send(msg(Proto.T.clip, ["text": text]))
     }
@@ -190,7 +230,8 @@ final class Clip: Feature {
                 self.core.send(msg(Proto.T.clipImagePart, ["id": id, "i": i, "data": chunk.base64EncodedString()]))
             }
         }
-        remember(Item(dir: "out", text: "Picture · \(w) × \(h)"))
+        expectEcho()
+        remember(Item(dir: "out", text: tr("Picture · {w} × {h}", ["w": w, "h": h]), pic: true))
         return true
     }
 

@@ -17,15 +17,15 @@ object QuickActions {
     class Btn(val id: String, val label: String, val hint: String)
 
     const val MAX = 3
-    val ALL = listOf(
-        Btn("clip", "Send clipboard", "This phone’s clipboard to the computer"),
-        Btn("files", "Send files", "Pick files to send"),
-        Btn("remote", "Touchpad", "The Remote’s touchpad and keyboard"),
-        Btn("media", "Play/Pause", "What plays on the computer"),
-        Btn("ring", "Ring computer", "Find it by its sound"),
-        Btn("lock", "Lock computer", "Lock its screen"),
-        Btn("disconnect", "Disconnect", "End the connection"),
-        Btn("exit", "Exit", "Close TwinDesk until it’s opened again"),
+    val ALL get() = listOf(
+        Btn("clip", tr("Send clipboard"), tr("Sends this phone’s clipboard to the computer")),
+        Btn("files", tr("Send files"), tr("Opens the file picker")),
+        Btn("remote", tr("Touchpad"), tr("Opens the Remote’s touchpad and keyboard")),
+        Btn("media", tr("Play/Pause"), tr("Media playing on the computer")),
+        Btn("ring", tr("Ring computer"), tr("Plays a sound on the computer")),
+        Btn("lock", tr("Lock computer"), tr("Locks the computer’s screen")),
+        Btn("disconnect", tr("Disconnect"), tr("Ends the connection")),
+        Btn("exit", tr("Exit"), tr("Closes TwinDesk until it’s opened again")),
     )
     private val DEFAULT = listOf("clip", "disconnect", "exit")
 
@@ -74,7 +74,7 @@ class PickActivity : Activity() {
         if (savedInstanceState != null) return
         val core = Core.get(this)
         if (core.host == null) {
-            Toast.makeText(applicationContext, "Not connected to your computer", Toast.LENGTH_SHORT).show()
+            Toast.makeText(applicationContext, tr("Not connected to your computer"), Toast.LENGTH_SHORT).show()
             return finish()
         }
         val i = Intent(Intent.ACTION_GET_CONTENT).setType("*/*").addCategory(Intent.CATEGORY_OPENABLE).putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
@@ -91,7 +91,7 @@ class PickActivity : Activity() {
         if (resultCode == RESULT_OK && uris.isNotEmpty()) {
             val core = Core.get(this)
             core.files.send(core.files.describe(uris), "send")
-            Toast.makeText(applicationContext, "Sending to ${core.host?.name ?: "your computer"}", Toast.LENGTH_SHORT).show()
+            Toast.makeText(applicationContext, tr("Sending to {name}", "name" to (core.host?.name ?: tr("your computer"))), Toast.LENGTH_SHORT).show()
         }
         finish()
     }

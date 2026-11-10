@@ -1,6 +1,8 @@
 // TwinDesk — Copyright (C) 2026 inukaasith. GPL-3.0, see LICENSE.
-// Connect with Android: this phone and another phone with TwinDesk, side by side with the computer's
-// session (Core.link) and never in its way. Its own link, its own paired list, its own port.
+// Connect with Android: this phone and another phone with TwinDesk. One session at a time, as on the
+// computers: a phone's session ends the computer's (Core.link) and a computer's ends the phone's, and
+// while a phone is connected the app's pages are that phone's (only what both can do: peer.info's
+// caps). Its own link, its own paired list, its own port.
 //
 // Roles: the phone that taps Connect is the guest, the other the host. The host runs PeerServer
 // (always, with "Host for other phones" on; else only when asked: peer.ask over discovery, which a
@@ -56,9 +58,9 @@ class Peer(val core: Core) : PeerServer.Handler, Link.Events {
     private val xfer = Executors.newCachedThreadPool { r -> Thread(r, "td-peer-x").apply { isDaemon = true } }
 
     // ---- settings ----
-    // Connect with Android itself (on by default): off, other phones don't see this one (Discovery's
+    // Connect with Android itself (off until turned on): off, other phones don't see this one (Discovery's
     // peerOn), nothing hosts, a session with a phone ends.
-    val on get() = store.flag("peer.on", true)
+    val on get() = store.flag("peer.on", false)
     fun setOn(v: Boolean) {
         store.setFlag("peer.on", v)
         core.discovery.peerOn = v
@@ -88,6 +90,19 @@ class Peer(val core: Core) : PeerServer.Handler, Link.Events {
     @Volatile private var hostWs: PeerServer.Ws? = null
     @Volatile private var key = "" // the session's key for its HTTPS requests
     val connected get() = role.isNotEmpty()
+    // The other phone: its os (from pairing or its hello) and what it can do (peer.info's caps).
+    @Volatile var peerOs = ""; private set
+    @Volatile private var peerCaps: Set<String>? = null
+    fun can(c: String): Boolean = c in (peerCaps ?: defaultCaps(peerOs))
+    // What this phone offers the other: the same names in our peer.info.
+    fun myCaps(): Set<String> = buildSet {
+        addAll(listOf("clip", "notifs", "files", "screen", "photos"))
+        if (core.hub.perm("messages") != "none") add("messages")
+        if (core.hub.perm("files") != "none") add("fs")
+    }
+    // A phone older than caps: an iPhone has no messages or storage to browse; an Android phone has all.
+    private fun defaultCaps(os: String) = if (os == "ios") setOf("clip", "notifs", "files", "screen", "photos")
+        else setOf("clip", "notifs", "files", "screen", "photos", "messages", "fs")
     @Volatile var message = ""; private set
 
     // ---- pairing, as the host (mac/pairing.js) ----
@@ -137,12 +152,12 @@ class Peer(val core: Core) : PeerServer.Handler, Link.Events {
         val now = System.currentTimeMillis()
         // The host's liveness: the guest pings every second (Link).
         hostWs?.let { w -> if (now - w.lastRx > Proto.TIMEOUT_MS) { Log.i("TwinDesk", "peer: $peerName stopped answering"); w.close() } else w.send(msg(Proto.T.PING, "ts" to now).toString()) }
-        pairing?.let { p -> if (now - p.at > 60_000) { fail(p.ws, Proto.E.PAIR_TIMEOUT, "Pairing timed out"); pairing = null; core.changed() } }
+        pairing?.let { p -> if (now - p.at > 60_000) { pairing = null; pairFailed(p.ws); fail(p.ws, Proto.E.PAIR_TIMEOUT, "Pairing timed out"); core.changed() } }
         // Waiting for the other phone to host: it's in its beacon (or peer.hosting) now.
         if (waitingFor.isNotEmpty()) {
             val f = core.discovery.phones[waitingFor]
             if (f != null && f.port > 0) { waitingFor = ""; main.post { connect(f) } }
-            else if (now > waitUntil) { waitingFor = ""; message = "${f?.name ?: "That phone"} didn’t answer. Open TwinDesk on it, or turn on Host for other phones there."; core.changed() }
+            else if (now > waitUntil) { waitingFor = ""; message = tr("{name} didn’t answer. Open TwinDesk on it, or turn on Host for other phones there.", "name" to (f?.name ?: tr("That phone"))); core.changed() }
         }
         if (ticks % 5 == 0) hosting()
     }
@@ -199,6 +214,8 @@ class Peer(val core: Core) : PeerServer.Handler, Link.Events {
         role = "guest"
         peerId = host.id
         peerName = host.name
+        peerOs = host.os
+        peerCaps = null
         key = ""
         // A token for the other way (it can connect to us later, without pairing again), and our certificate.
         val token = Proto.randomHex(32)
@@ -245,22 +262,22 @@ class Peer(val core: Core) : PeerServer.Handler, Link.Events {
             Proto.T.PAIR_START -> pairStart(ws, m)
             Proto.T.PAIR_REVEAL -> pairing?.takeIf { it.ws === ws }?.let { p ->
                 val nonce = m.optString("nonce")
-                if (p.nw.isNotEmpty() || !Regex("^[0-9a-f]{32}$").matches(nonce) || Proto.commitOf(nonce) != p.commit) { pairing = null; fail(ws, Proto.E.PAIR_REFUSED, "Nonce does not match"); core.changed(); return }
+                if (p.nw.isNotEmpty() || !Regex("^[0-9a-f]{32}$").matches(nonce) || Proto.commitOf(nonce) != p.commit) { pairing = null; pairFailed(ws); fail(ws, Proto.E.PAIR_REFUSED, "Nonce does not match"); core.changed(); return }
                 p.nw = nonce
                 p.code = Proto.sasCode(myFp, p.nw, p.nm)
                 Log.i("TwinDesk", "peer: pairing code ready for ${p.name}")
                 core.changed()
-                main.post { Notify.peer(ctx, "Pair with ${p.name}?", "Check that both phones show the same code in TwinDesk.") }
+                main.post { Notify.peer(ctx, tr("Pair with {name}?", "name" to p.name), tr("Check that both phones show the same code in TwinDesk.")) }
             }
             Proto.T.PAIR_CONFIRM -> pairing?.takeIf { it.ws === ws && it.code.isNotEmpty() }?.let { it.confirmed = true; finishPair() }
-            Proto.T.PAIR_CANCEL -> { if (pairing?.ws === ws) { pairing = null; core.changed() }; ws.close() }
+            Proto.T.PAIR_CANCEL -> { if (pairing?.ws === ws) { pairing = null; pairFailed(ws); core.changed() }; ws.close() }
             Proto.T.HELLO -> hello(ws, m)
             else -> fail(ws, "bad_message", "\"$t\" before welcome")
         }
     }
 
     override fun onClose(ws: PeerServer.Ws) {
-        if (pairing?.ws === ws) { pairing = null; core.changed() }
+        if (pairing?.ws === ws) { pairing = null; pairFailed(ws); core.changed() }
         if (ws === hostWs) { hostWs = null; ended() }
     }
 
@@ -269,13 +286,31 @@ class Peer(val core: Core) : PeerServer.Handler, Link.Events {
         ws.close()
     }
 
+    // Failed pairings per address, as shared/pairfail.js: after 5 in 10 minutes that address can't
+    // start another for a while, so a phone on the network can't keep popping the dialog.
+    private val pairFails = HashMap<String, MutableList<Long>>()
+    private fun pairFailed(ws: PeerServer.Ws) {
+        val a = ws.address
+        if (a.isEmpty() || a == "127.0.0.1") return
+        val now = System.currentTimeMillis()
+        synchronized(pairFails) { pairFails.getOrPut(a) { mutableListOf() }.apply { removeAll { now - it >= 600_000 }; add(now) } }
+    }
+    private fun pairLocked(ws: PeerServer.Ws): Boolean = synchronized(pairFails) {
+        val l = pairFails[ws.address] ?: return false
+        val now = System.currentTimeMillis()
+        l.removeAll { now - it >= 600_000 }
+        if (l.isEmpty()) pairFails.remove(ws.address)
+        l.size >= 5
+    }
+
     private fun pairStart(ws: PeerServer.Ws, m: JSONObject) {
+        if (pairLocked(ws)) return fail(ws, Proto.E.PAIR_REFUSED, "Too many failed pairing attempts; wait a few minutes and try again")
         val p = pairing
         if (p != null && p.ws !== ws) return fail(ws, Proto.E.BUSY, "Another pairing is in progress")
         if (m.optInt("v") != Proto.VERSION) return fail(ws, Proto.E.VERSION_MISMATCH, "Different TwinDesk version")
         val id = m.optString("id")
         val commit = m.optString("commit")
-        if (id.isEmpty() || !Regex("^[0-9a-f]{64}$").matches(commit)) return fail(ws, "bad_message", "pair.start needs id and commit")
+        if (id.isEmpty() || !Regex("^[0-9a-f]{64}$").matches(commit)) { pairFailed(ws); return fail(ws, "bad_message", "pair.start needs id and commit") }
         val nm = Proto.randomHex(16)
         pairing = PairReq(ws, id.take(64), m.optString("name").take(64).ifEmpty { "Phone" }, commit, nm)
         ws.send(msg(Proto.T.PAIR_NONCE, "nonce" to nm, "os" to Proto.OS).toString())
@@ -286,7 +321,7 @@ class Peer(val core: Core) : PeerServer.Handler, Link.Events {
     // Allow / Deny here (the dialog).
     fun respondPair(allow: Boolean) {
         val p = pairing ?: return
-        if (!allow) { pairing = null; fail(p.ws, Proto.E.PAIR_REFUSED, "Refused"); core.changed(); return }
+        if (!allow) { pairing = null; pairFailed(p.ws); fail(p.ws, Proto.E.PAIR_REFUSED, "Refused"); core.changed(); return }
         if (p.code.isEmpty()) return
         p.allowed = true
         finishPair()
@@ -302,6 +337,7 @@ class Peer(val core: Core) : PeerServer.Handler, Link.Events {
         store.setPrefsString(GUESTS, g.toString())
         p.ws.send(msg(Proto.T.PAIR_OK, "token" to token, "macId" to store.deviceId, "macName" to store.deviceName, "os" to Proto.OS).toString())
         pairing = null
+        synchronized(pairFails) { pairFails.remove(p.ws.address) }
         Log.i("TwinDesk", "peer: paired with ${p.name}")
         core.changed()
     }
@@ -321,6 +357,8 @@ class Peer(val core: Core) : PeerServer.Handler, Link.Events {
         role = "host"
         peerId = id
         peerName = m.optString("name").take(64).ifEmpty { e.optString("name") }
+        peerOs = m.optString("os").take(20)
+        peerCaps = null
         e.put("name", peerName); val g = guests(); g.put(id, e); store.setPrefsString(GUESTS, g.toString())
         key = Proto.randomHex(16)
         ws.send(msg(Proto.T.WELCOME, "v" to Proto.VERSION, "macId" to store.deviceId, "macName" to store.deviceName, "os" to Proto.OS).toString())
@@ -343,7 +381,9 @@ class Peer(val core: Core) : PeerServer.Handler, Link.Events {
     private fun started() {
         Log.i("TwinDesk", "peer: session with $peerName as $role")
         message = ""
-        send(msg("peer.info", "model" to android.os.Build.MODEL))
+        send(msg("peer.info", "model" to android.os.Build.MODEL, "os" to Proto.OS, "caps" to JSONArray(myCaps().toList())))
+        // One session: the computer's ends (Core.connect and Core.onWelcome end ours the other way).
+        if (core.link.connected || core.link.state == "connecting") { Log.i("TwinDesk", "peer: ending the computer's session for $peerName"); core.disconnect() }
         core.changed()
     }
 
@@ -351,9 +391,10 @@ class Peer(val core: Core) : PeerServer.Handler, Link.Events {
         Log.i("TwinDesk", "peer: session with $peerName ended")
         role = ""
         key = ""
+        peerCaps = null
         val waiting = calls.values.toList()
         calls.clear()
-        main.post { for (cb in waiting) runCatching { cb(JSONObject().put("error", "Disconnected")) } }
+        main.post { for (cb in waiting) runCatching { cb(JSONObject().put("error", tr("Disconnected"))) } }
         for (id in inFiles.keys.toList()) inFailed(id)
         outFiles.clear()
         PeerScreen.stopAll(this)
@@ -370,7 +411,7 @@ class Peer(val core: Core) : PeerServer.Handler, Link.Events {
                 val last = asked
                 if (last != null && last.id == f.id) return
                 asked = f
-                Notify.peer(ctx, "${f.name} wants to connect", "Open TwinDesk to let it connect to this phone.")
+                Notify.peer(ctx, tr("{name} wants to connect", "name" to f.name), tr("Open TwinDesk to allow the connection."))
                 core.changed()
             }
             "peer.hosting" -> {
@@ -379,7 +420,7 @@ class Peer(val core: Core) : PeerServer.Handler, Link.Events {
                     core.discovery.phones[f.id] = (core.discovery.phones[f.id] ?: f).copy(address = f.address, port = port, lastSeen = System.currentTimeMillis())
                 }
             }
-            "peer.no" -> if (waitingFor == f.id) { waitingFor = ""; message = "${f.name} said not now."; core.changed() }
+            "peer.no" -> if (waitingFor == f.id) { waitingFor = ""; message = tr("{name} said not now.", "name" to f.name); core.changed() }
         }
     }
 
@@ -406,7 +447,12 @@ class Peer(val core: Core) : PeerServer.Handler, Link.Events {
     private fun dispatch(m: JSONObject) {
         when (m.optString("t")) {
             "peer.key" -> key = m.optString("key").take(64)
-            "peer.info" -> { peerModel = m.optString("model").take(80); core.changed() }
+            "peer.info" -> {
+                peerModel = m.optString("model").take(80)
+                m.optString("os").take(20).takeIf { it.isNotEmpty() }?.let { peerOs = it }
+                m.optJSONArray("caps")?.let { a -> peerCaps = (0 until a.length()).map { a.optString(it).take(20) }.toSet() }
+                core.changed()
+            }
             // The other way: the guest can be reached as a host too, with this token.
             "peer.rev" -> if (role == "host") {
                 val token = m.optString("token")
@@ -503,7 +549,7 @@ class Peer(val core: Core) : PeerServer.Handler, Link.Events {
     private val outFiles = ConcurrentHashMap<String, OutFile>()
     private val inFiles = ConcurrentHashMap<String, InFile>()
     private val batches = ConcurrentHashMap<String, Batch>()
-    val busyLine: String? get() = batches.values.firstOrNull()?.let { b -> "${if (b.up) "Sending" else "Receiving"} ${b.name} · ${Files.pct(b.moved, b.bytes)}%" }
+    val busyLine: String? get() = batches.values.firstOrNull()?.let { b -> if (b.up) tr("Sending {file} · {pct}%", "file" to b.name, "pct" to Files.pct(b.moved, b.bytes)) else tr("Receiving {file} · {pct}%", "file" to b.name, "pct" to Files.pct(b.moved, b.bytes)) }
 
     // Send these to the other phone. rel: folders kept (its Files).
     fun sendFiles(items: List<Files.Item>): Boolean {
@@ -642,7 +688,7 @@ class Peer(val core: Core) : PeerServer.Handler, Link.Events {
         val now = System.currentTimeMillis()
         if (now - b.last < 400) return
         b.last = now
-        Notify.files(ctx, b.key, "${if (b.up) "Sending" else "Receiving"} ${b.name} ${if (b.up) "to" else "from"} $peerName", "${Files.pct(b.moved, b.bytes)}%", Files.pct(b.moved, b.bytes), null, up = b.up)
+        Notify.files(ctx, b.key, if (b.up) tr("Sending {file} to {name}", "file" to b.name, "name" to peerName) else tr("Receiving {file} from {name}", "file" to b.name, "name" to peerName), "${Files.pct(b.moved, b.bytes)}%", Files.pct(b.moved, b.bytes), null, up = b.up)
         core.changed()
     }
 
@@ -655,10 +701,10 @@ class Peer(val core: Core) : PeerServer.Handler, Link.Events {
             if (b.done < b.count) return
         }
         batches.remove(batch)
-        if (b.up) Notify.files(ctx, b.key, if (b.ok) "Sent ${b.name}" else "Not everything arrived", "On $peerName", null, null, up = true)
+        if (b.up) Notify.files(ctx, b.key, if (b.ok) tr("Sent {file}", "file" to b.name) else tr("Not everything arrived"), tr("On {name}", "name" to peerName), null, null, up = true)
         else {
             val open = b.only?.let { Notify.viewIntent(it.first, it.second) } ?: Intent(android.app.DownloadManager.ACTION_VIEW_DOWNLOADS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            Notify.files(ctx, b.key, if (b.ok) "${b.name} from $peerName" else "Not everything arrived from $peerName", if (b.ok) "In Downloads › TwinDesk. Tap to open." else "${b.name} is incomplete", null, open)
+            Notify.files(ctx, b.key, if (b.ok) tr("{what} from {from}", "what" to b.name, "from" to peerName) else tr("Some files didn’t arrive from {from}", "from" to peerName), if (b.ok) tr("In Downloads › TwinDesk. Tap to open.") else tr("{what} is incomplete", "what" to b.name), null, open)
         }
         core.changed()
     }
@@ -675,12 +721,12 @@ class Peer(val core: Core) : PeerServer.Handler, Link.Events {
 
     // Ask the other phone; the answer comes on the main thread ({error} when it can't).
     fun ask(op: String, args: JSONObject = JSONObject(), timeoutMs: Long = 20_000, cb: (JSONObject) -> Unit) {
-        if (!connected) { main.post { cb(JSONObject().put("error", "Not connected")) }; return }
+        if (!connected) { main.post { cb(JSONObject().put("error", tr("Not connected"))) }; return }
         val id = Proto.randomHex(8)
         calls[id] = cb
         args.put("t", "q").put("qid", id).put("op", op)
         send(args)
-        main.postDelayed({ calls.remove(id)?.let { it(JSONObject().put("error", "No answer")) } }, timeoutMs)
+        main.postDelayed({ calls.remove(id)?.let { it(JSONObject().put("error", tr("No answer"))) } }, timeoutMs)
     }
 
     private val messages by lazy { Messages(core.hub, core) }

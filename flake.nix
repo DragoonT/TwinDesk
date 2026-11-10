@@ -27,7 +27,7 @@
         rec {
           twindesk = pkgs.stdenv.mkDerivation rec {
             pname = "twindesk";
-            version = "2.5.3";
+            version = "3.0.0";
 
             src = self;
 

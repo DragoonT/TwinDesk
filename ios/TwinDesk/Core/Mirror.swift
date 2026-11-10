@@ -8,29 +8,45 @@
 //   phone.mirror.want {on, key, maxSize, bitrate, fps} | {on, sync}   from it
 //   phone.mirror.state {on, waiting, error, w, h, sw, sh, key}        to it
 //   POST /twindesk/mirror (x-twindesk-mirror: key), the session's HTTPS port: scrcpy's packets
+// When the computer asks (its Show screen), it names its AirPlay receiver too (want.airplay, turned
+// on there): the app asks here, Share Screen or Screen Mirroring to it (UI/MirrorGuide.swift shows
+// where that is), and phone.mirror.state {on: false, airplay: true} closes its window for AirPlay's.
 import Foundation
 import Network
 import UIKit
 
-final class Mirror: Feature, URLSessionTaskDelegate, StreamDelegate {
+final class Mirror: Feature {
     static let port: UInt16 = 47830
 
     private var listener: NWListener?
     private var ext: NWConnection? // the broadcast extension, while it shares
     private var rx = Data()
-    private(set) var sharing = false // the extension is running
+    private(set) var sharing = false { didSet { if sharing { asking = false } } } // the extension is running
+    var asking = false // the computer asked to see this screen: the app asks how (MirrorAskSheet)
+    private(set) var airplayTo: String? // the computer's AirPlay receiver (Screen Mirroring lists it so)
+    // A Mac whose AirPlay Receiver is off (want.airplayOff): the sheet says where to turn it on there.
+    private(set) var airplayOff = false
+    // Where Screen Mirroring goes: the receiver the computer named, else the computer's own name.
+    var airplayName: String { airplayTo ?? core.link.host?.name ?? tr("the computer") }
     private(set) var size: (w: Int, h: Int, sw: Int, sh: Int)?
     private var want: JSON? // the computer's phone.mirror.want, while its window is open
     private var key = ""
-    private var session: URLSession?
-    private var upload: URLSessionUploadTask?
-    private var out: OutputStream?
-    private var pendingIn: InputStream?
+    private var upload: NWConnection? // io only: the stream to the computer, while it goes
+    private var uploadGen = 0 // main: which stream is current (an old one's end restarts nothing)
+    private var inflight = 0 // io only: bytes handed to the connection, not sent yet
+    private var skipToKey = false // io only: frames dropped, so the rest wait for the next keyframe
     private let io = DispatchQueue(label: "td.mirror")
-    private var backlog = [Data]() // io only: packets waiting for room in the body stream
     private var sessionPacket: Data? // the size packet: first in every new request
     private var configPacket: Data? // SPS/PPS: next, so the window can decode from the first frame
     var peerTap: ((Data) -> Void)? // a phone watching (Peer.swift): every packet, as it comes
+    // Share was tapped and iOS's sheet is up (it takes the app out of focus): the session stays on
+    // Wi-Fi meanwhile (Core.networkBusy), so the picture has a way once the broadcast starts.
+    var starting: Bool { startUntil > Date() }
+    private var startUntil = Date.distantPast
+    func willStart() { startUntil = Date().addingTimeInterval(30) }
+    private var openPending = false // shared while the session was on Bluetooth: told once it's on the network
+    private var uploadPending = false // asked for while on Bluetooth: the stream starts once on the network
+    private var graceWork: DispatchWorkItem? // the session dropped while sharing: the broadcast waits this long
 
     override init(_ core: Core) {
         super.init(core)
@@ -64,21 +80,61 @@ final class Mirror: Feature, URLSessionTaskDelegate, StreamDelegate {
         }
         c.start(queue: .main)
         sharing = true
+        startUntil = .distantPast
+        sendExt(["ack": 1]) // the extension knows the app has it (else it ends the broadcast, never recording for nothing)
         Background.shared.apply() // the app stays up while it relays the screen
         read(c)
         core.changed()
-        if !core.connected {
-            // Nothing to share with: the broadcast stops itself and says why.
-            sendExt(["stop": 1])
+        // A phone holds the session (Peer, phone to phone: no computer then): the screen goes to it,
+        // once it asks (screen.start) or at once if it asked before Share Screen was started.
+        if core.peer.connected {
+            core.peer.shareStarted()
             return
         }
-        core.needNetwork() // gone onto Bluetooth on the way out: the picture needs the network
-        if want == nil {
-            // Started here: the computer opens its window and asks (phone.mirror.want).
-            core.send(msg("phone.mirror", ["open": true]))
-        } else {
-            configure()
+        if !core.connected {
+            // Nothing to share with: a session coming back soon still gets it (onWelcome), else the
+            // broadcast stops itself and says why.
+            waitForSession()
+            return
         }
+        announce()
+    }
+
+    // Shared from here: the computer opens its window and asks (phone.mirror.want). On Bluetooth the
+    // picture has no way: back onto the network first (told then, networkBack), or after a few
+    // seconds anyway (the computer says what it needs).
+    private func announce() {
+        guard sharing, core.connected else { return }
+        if want != nil { return configure() }
+        if core.link.viaBle {
+            openPending = true
+            core.needNetwork()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 6) { [weak self] in
+                guard let self = self, self.openPending, self.sharing, self.core.connected else { return }
+                self.openPending = false
+                self.core.send(msg("phone.mirror", ["open": true]))
+            }
+            return
+        }
+        openPending = false
+        core.send(msg("phone.mirror", ["open": true]))
+    }
+
+    // The session moved from Bluetooth back onto the network (Core.offBle): what waited for it now.
+    func networkBack() {
+        guard sharing, core.connected, !core.link.viaBle else { return }
+        if openPending { openPending = false; core.send(msg("phone.mirror", ["open": true])) }
+        if uploadPending || want != nil { uploadPending = false; startUpload() } // a stream on the old way: again on this one
+    }
+
+    private func waitForSession() {
+        graceWork?.cancel()
+        let w = DispatchWorkItem { [weak self] in
+            guard let self = self, self.sharing, !self.core.connected, !self.core.peer.connected else { return }
+            self.sendExt(["stop": 1])
+        }
+        graceWork = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + 15, execute: w)
     }
 
     private func read(_ c: NWConnection) {
@@ -111,6 +167,10 @@ final class Mirror: Feature, URLSessionTaskDelegate, StreamDelegate {
     private func extGone() {
         guard sharing else { return }
         sharing = false
+        graceWork?.cancel()
+        graceWork = nil
+        openPending = false
+        uploadPending = false
         Background.shared.apply()
         ext?.cancel()
         ext = nil
@@ -121,6 +181,8 @@ final class Mirror: Feature, URLSessionTaskDelegate, StreamDelegate {
             core.send(msg("phone.mirror", ["open": false]))
         }
         core.changed()
+        // Shared off screen and done: onto Bluetooth now (Core.backgrounded waited for it).
+        DispatchQueue.main.async { if !self.core.inFront { self.core.backgrounded() } }
     }
 
     private func sendExt(_ m: JSON) {
@@ -149,6 +211,8 @@ final class Mirror: Feature, URLSessionTaskDelegate, StreamDelegate {
     override func onMessage(_ t: String, _ m: JSON) -> Bool {
         guard t == "phone.mirror.want" else { return false }
         if !m.bool("on") {
+            asking = false
+            core.changed()
             want = nil
             endUpload()
             if sharing { sendExt(["stop": 1]) }
@@ -160,25 +224,65 @@ final class Mirror: Feature, URLSessionTaskDelegate, StreamDelegate {
         }
         want = m
         key = m.str("key", max: 64)
+        let air = m.str("airplay", max: 100)
+        if !air.isEmpty { airplayTo = air }
+        airplayOff = m.bool("airplayOff")
         if sharing { configure() }
         else {
             // The computer asked first (its Show Phone Screen): Start is the person's, on this iPhone.
             core.send(msg("phone.mirror.state", ["on": false, "waiting": true, "key": key]))
-            Notifier.shared.shareAsk(core.link.host?.name ?? "The computer")
+            asking = true
+            core.changed()
+            Notifier.shared.shareAsk(core.link.host?.name ?? tr("The computer"), airplay: airplayTo)
         }
         return true
     }
 
+    // Screen Mirroring (AirPlay) in place of Share Screen: the computer's waiting window closes,
+    // its AirPlay receiver shows the screen.
+    func useAirPlay() {
+        asking = false
+        if want != nil && !sharing {
+            core.send(msg("phone.mirror.state", ["on": false, "airplay": true, "key": key]))
+            want = nil
+        }
+        Notifier.shared.cancel("share")
+        core.changed()
+    }
+
+    // Not now: the computer's window says so and closes.
+    func decline() {
+        asking = false
+        if want != nil && !sharing {
+            core.send(msg("phone.mirror.state", ["on": false, "error": "Not shared from the \(Device.word)", "key": key]))
+            want = nil
+        }
+        Notifier.shared.cancel("share")
+        core.changed()
+    }
+
+    // The session dropped (a Wi-Fi blip, the computer restarting): the broadcast waits a little for it
+    // to come back (onWelcome) before it stops, and encodes nothing meanwhile.
     override func onClosed() {
+        asking = false
         want = nil
+        openPending = false
+        uploadPending = false
         endUpload()
-        if sharing { sendExt(["stop": 1]) }
+        if sharing { sendExt(["want": 0]); waitForSession() }
+    }
+
+    override func onWelcome(_ host: Computer, _ m: JSON) {
+        graceWork?.cancel()
+        graceWork = nil
+        if sharing { announce() }
     }
 
     private func configure() {
         guard let w = want else { return }
         sendExt(["maxSize": w.int("maxSize"), "bitrate": w.int("bitrate", 8_000_000), "fps": min(60, w.int("fps", 30)), "want": 1, "sync": 1])
-        startUpload()
+        if core.link.viaBle { uploadPending = true; core.needNetwork() } // no picture through Bluetooth (networkBack)
+        else { startUpload() }
         sendState()
     }
 
@@ -188,107 +292,113 @@ final class Mirror: Feature, URLSessionTaskDelegate, StreamDelegate {
     }
 
     // ---- the stream: one long POST, its body fed as packets come ----
+    //
+    // A TLS connection of our own (the computer's certificate pinned as the session's), the request
+    // written by hand with a chunked body: each packet one chunk, sent as it comes. (It was a
+    // URLSession upload fed through bound streams whose run loop held the queue the packets came in
+    // on, so after the first two packets nothing more reached the computer.)
 
     private func startUpload() {
         endUpload()
-        guard var req = core.link.sessionRequest("/twindesk/mirror", method: "POST") else {
+        guard let req = core.link.sessionRequest("/twindesk/mirror", method: "POST"), let u = req.url, let host = u.host, let port = u.port,
+              let nwPort = NWEndpoint.Port(rawValue: UInt16(port)) else {
             core.send(msg("phone.mirror.state", ["on": false, "error": "the connection closed", "key": key]))
             return
         }
-        req.setValue(key, forHTTPHeaderField: "x-twindesk-mirror")
-        req.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
-        req.timeoutInterval = 3600
-        var i: InputStream?
-        var o: OutputStream?
-        Stream.getBoundStreams(withBufferSize: 1 << 20, inputStream: &i, outputStream: &o)
-        guard let ins = i, let outs = o else { return }
-        pendingIn = ins
-        let cfg = URLSessionConfiguration.default
-        cfg.timeoutIntervalForRequest = 3600
-        let s = URLSession(configuration: cfg, delegate: self, delegateQueue: nil)
-        session = s
-        io.async {
-            outs.delegate = self
-            outs.schedule(in: .current, forMode: .default)
-            outs.open()
-            self.out = outs
-            self.backlog = [self.sessionPacket, self.configPacket].compactMap { $0 }
-            self.pump()
-            // The stream's run loop: io's thread for as long as the body is fed.
-            while self.out === outs { RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.25)) }
+        let pin = core.link.seenFp.isEmpty ? (core.link.host?.fp ?? "") : core.link.seenFp
+        let tls = NWProtocolTLS.Options()
+        sec_protocol_options_set_verify_block(tls.securityProtocolOptions, { _, trust, done in
+            let fp = Link.leafFingerprint(sec_trust_copy_ref(trust).takeRetainedValue())
+            done(fp != nil && (pin.isEmpty || fp == pin))
+        }, io)
+        let tcp = NWProtocolTCP.Options()
+        tcp.noDelay = true
+        let c = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: NWParameters(tls: tls, tcp: tcp))
+        uploadGen += 1
+        let gen = uploadGen
+        let head = "POST /twindesk/mirror HTTP/1.1\r\nHost: \(host):\(port)\r\nContent-Type: application/octet-stream\r\n"
+            + "x-twindesk-mirror: \(key)\r\nTransfer-Encoding: chunked\r\n\r\n"
+        let first = [sessionPacket, configPacket].compactMap { $0 }
+        c.stateUpdateHandler = { [weak self] st in
+            guard let self = self else { return }
+            switch st {
+            case .ready:
+                c.send(content: Data(head.utf8), completion: .contentProcessed { _ in })
+                self.upload = c
+                self.inflight = 0
+                self.skipToKey = true // from a keyframe on (the extension is asked for one)
+                for p in first { self.chunk(c, p) }
+                DispatchQueue.main.async { self.sendExt(["sync": 1]) }
+                self.drain(c, gen)
+            case .failed(let e):
+                NSLog("TwinDesk: screen stream: %@", e.localizedDescription)
+                c.cancel()
+                self.uploadEnded(c, gen)
+            case .cancelled: self.uploadEnded(c, gen)
+            default: break
+            }
         }
-        let t = s.uploadTask(withStreamedRequest: req)
-        upload = t
-        t.resume()
+        c.start(queue: io)
+    }
+
+    // The computer's answer: read and dropped; its end is the stream's.
+    private func drain(_ c: NWConnection, _ gen: Int) {
+        c.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] _, _, done, err in
+            if done || err != nil { c.cancel(); self?.uploadEnded(c, gen); return }
+            self?.drain(c, gen)
+        }
+    }
+
+    // io: gone (the computer closed it, the network dropped). Still sharing and still wanted: again.
+    private func uploadEnded(_ c: NWConnection, _ gen: Int) {
+        if upload === c { upload = nil }
+        DispatchQueue.main.async {
+            guard gen == self.uploadGen else { return }
+            NSLog("TwinDesk: screen stream ended")
+            if self.sharing, self.want != nil, self.core.connected {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { if gen == self.uploadGen && self.sharing && self.want != nil { self.startUpload() } }
+            }
+        }
     }
 
     private func endUpload() {
-        upload?.cancel()
-        upload = nil
-        session?.invalidateAndCancel()
-        session = nil
+        uploadGen += 1
         io.async {
-            self.out?.close()
-            self.out = nil
-            self.backlog.removeAll()
+            guard let c = self.upload else { return }
+            self.upload = nil
+            c.send(content: Data("0\r\n\r\n".utf8), completion: .contentProcessed { _ in c.cancel() })
         }
+    }
+
+    // io: one packet as one chunk.
+    private func chunk(_ c: NWConnection, _ p: Data) {
+        var d = Data(String(p.count, radix: 16).utf8)
+        d.append(contentsOf: [13, 10])
+        d.append(p)
+        d.append(contentsOf: [13, 10])
+        let n = d.count
+        inflight += n
+        c.send(content: d, completion: .contentProcessed { [weak self] _ in self?.io.async { self?.inflight -= n } })
     }
 
     // A packet from the extension: kept if it's the size or SPS/PPS, then on to the computer.
     private func packet(_ p: Data) {
         guard p.count >= 12 else { return }
         peerTap?(p)
-        if p[p.startIndex] & 0x80 != 0 { sessionPacket = p; configPacket = nil }
-        else if p[p.startIndex] & 0x40 != 0 { configPacket = p } // bit 62: config
+        let b = p[p.startIndex]
+        if b & 0x80 != 0 { sessionPacket = p; configPacket = nil }
+        else if b & 0x40 != 0 { configPacket = p } // bit 62: config
         io.async {
-            guard self.out != nil else { return }
-            // Behind by more than ~2 s of picture: drop what's waiting and ask for a keyframe.
-            if self.backlog.reduce(0, { $0 + $1.count }) > 4 << 20 {
-                self.backlog = [self.configPacket].compactMap { $0 }
-                DispatchQueue.main.async { self.sendExt(["sync": 1]) }
+            guard let c = self.upload else { return }
+            let special = b & 0xC0 != 0 // the size or SPS/PPS: always
+            let key = b & 0x20 != 0 // bit 61: a keyframe
+            // Behind by more than ~2 s of picture: frames dropped until a keyframe (asked for now).
+            if !special && self.inflight > 4 << 20 {
+                if !self.skipToKey { self.skipToKey = true; DispatchQueue.main.async { self.sendExt(["sync": 1]) } }
+                return
             }
-            self.backlog.append(p)
-            self.pump()
-        }
-    }
-
-    private func pump() {
-        guard let o = out else { return }
-        while !backlog.isEmpty, o.hasSpaceAvailable {
-            let d = backlog[0]
-            let n = d.withUnsafeBytes { o.write($0.bindMemory(to: UInt8.self).baseAddress!, maxLength: d.count) }
-            if n <= 0 { return }
-            if n < d.count { backlog[0] = d.subdata(in: (d.startIndex + n)..<d.endIndex) } else { backlog.removeFirst() }
-        }
-    }
-
-    func stream(_ s: Stream, handle e: Stream.Event) {
-        if e == .hasSpaceAvailable { pump() }
-        if e == .errorOccurred || e == .endEncountered { DispatchQueue.main.async { self.endUpload() } }
-    }
-
-    func urlSession(_ session: URLSession, task: URLSessionTask, needNewBodyStream completionHandler: @escaping (InputStream?) -> Void) {
-        completionHandler(pendingIn)
-        pendingIn = nil
-    }
-
-    func urlSession(_ session: URLSession, task: URLSessionTask, didReceive challenge: URLAuthenticationChallenge,
-                    completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
-        guard let trust = challenge.protectionSpace.serverTrust, let fp = Link.leafFingerprint(trust), fp == core.link.host?.fp else {
-            return completionHandler(.cancelAuthenticationChallenge, nil)
-        }
-        completionHandler(.useCredential, URLCredential(trust: trust))
-    }
-
-    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        DispatchQueue.main.async {
-            guard self.upload === task else { return }
-            NSLog("TwinDesk: screen stream ended: %@", error?.localizedDescription ?? "done")
-            self.upload = nil
-            // Still sharing and still wanted: a new request (the window keeps its decoder).
-            if self.sharing, self.want != nil, self.core.connected {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { if self.upload == nil && self.sharing { self.configure() } }
-            }
+            if !special && self.skipToKey { if key { self.skipToKey = false } else { return } }
+            self.chunk(c, p)
         }
     }
 }

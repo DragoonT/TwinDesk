@@ -29,9 +29,10 @@ final class Screen: Feature {
 
     // ---- options (General › Receive screen, and the viewer's bar) ----
     var touchpad: Bool { core.store.flag("screen.touchpad", false) } // off: touch screen (the pointer is where the finger is)
-    var sound: Bool { core.store.flag("screen.sound", true) }
+    var sound: Bool { core.store.flag("screen.sound", false) }
     var smooth: Bool { core.store.flag("screen.smooth", false) }
     var pen: Bool { core.store.flag("screen.pen", true) }
+    var penFast: Bool { core.store.flag("screen.penFast", false) } // Fast writing: the Pencil's samples batched (viewer.js)
 
     func setOpt(_ key: String, _ on: Bool) {
         core.store.setFlag(key, on)
@@ -40,8 +41,8 @@ final class Screen: Feature {
     }
 
     func opts() -> JSON {
-        msg("opts", ["sound": sound, "pacing": smooth ? "smooth" : "fast", "name": core.host?.name ?? "the computer",
-                     "touch": touchpad ? "pad" : "direct", "speed": core.remote.speed, "tap": core.remote.tapClick, "pen": pen])
+        msg("opts", ["sound": sound, "pacing": smooth ? "smooth" : "fast", "name": core.host?.name ?? tr("the computer"),
+                     "touch": touchpad ? "pad" : "direct", "speed": core.remote.speed, "tap": core.remote.tapClick, "pen": pen, "penFast": penFast])
     }
 
     func repost() { host?.post(opts()) }
@@ -121,7 +122,7 @@ final class Screen: Feature {
             if let w = was, !w.bool("on"), on, !viewing, !startedByUs {
                 autoOpened = true
                 if UIApplication.shared.applicationState == .active { autoOpen = true }
-                else { Notifier.shared.screen(core.host?.name ?? "Your computer") }
+                else { Notifier.shared.screen(core.host?.name ?? tr("Your computer")) }
             }
             if !on { Notifier.shared.cancel("screen") }
             if wantStart { startIfNeeded() }
@@ -156,11 +157,8 @@ final class PcSound: Feature {
     private(set) var playing = false
     var on: Bool { core.store.flag("audio.in", false) }
 
-    func set(_ v: Bool) {
-        core.store.setFlag("audio.in", v)
-        sendPolicy()
-        core.changed()
-    }
+    // Shared with the computer (PairSync "audio"): its Send this computer's sound follows.
+    func set(_ v: Bool) { core.sync.set("audio", "in", v) }
 
     func sendPolicy() {
         core.send(msg("audio.policy", ["accept": on]))
