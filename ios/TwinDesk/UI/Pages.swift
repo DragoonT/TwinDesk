@@ -369,17 +369,22 @@ enum Orientation {
     private static var scene: UIWindowScene? { UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first }
 
     static func landscape() { request(.landscape) }
+    static func portrait() { request(.portrait) }
     static func free() { request(Device.isPad ? .all : .allButUpsideDown) }
+    // The app's allowed orientations (AppDelegate): what was last asked for.
+    static private(set) var mask: UIInterfaceOrientationMask = Device.isPad ? .all : .allButUpsideDown
     static func toggle() {
         let land = scene?.interfaceOrientation.isLandscape == true
         request(land ? .portrait : .landscape)
     }
 
-    private static func request(_ mask: UIInterfaceOrientationMask) {
+    // The allowed orientations change first (AppDelegate reads `mask`), then the window turns.
+    private static func request(_ want: UIInterfaceOrientationMask) {
+        mask = want
         guard let s = scene else { return }
         if #available(iOS 16.0, *) {
-            s.requestGeometryUpdate(.iOS(interfaceOrientations: mask)) { _ in }
             s.keyWindow?.rootViewController?.setNeedsUpdateOfSupportedInterfaceOrientations()
+            s.requestGeometryUpdate(.iOS(interfaceOrientations: want)) { _ in }
         }
     }
 }
@@ -409,6 +414,10 @@ struct NotificationsView: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .glassCard()
+                // History (HistoryView.swift), and the computer's notifications shown here.
+                SectionTitle(text: tr("History"))
+                HistoryCard(what: "notifs")
+                RecentNotifs()
             }
         }
     }
@@ -685,9 +694,20 @@ struct AboutView: View {
                     let u = core.updates
                     DenseRow(symbol: "arrow.triangle.2.circlepath", title: "TwinDesk", hint: updateHint, divider: false) {
                         HStack(spacing: 8) {
-                            if u.available { Button(tr("Download")) { u.open() }.primaryButton() }
+                            // Installed by a computer's TwinDesk: it installs the new version over this one.
+                            let s = core.signer
+                            if s.mine && !s.newer.isEmpty {
+                                if s.running { ProgressView() }
+                                else { Button(tr("Install now")) { s.update() }.primaryButton().disabled(!s.canUpdate) }
+                            }
+                            if u.available { Button(tr("Download")) { u.open() }.secondaryButton() }
                             if u.checking { ProgressView() } else { Button(tr("Check now")) { u.checkNow() }.secondaryButton() }
                         }
+                    }
+                    if core.signer.mine && !core.signer.newer.isEmpty {
+                        Text(core.signer.canUpdate ? tr("Install now: {computer} signs TwinDesk {version} and installs it over this one. The app closes for a moment; your data stays.", ["computer": core.host?.name ?? tr("the computer"), "version": core.signer.newer])
+                             : tr("Install now needs App refresh on and this {device} connected to the computer that installed TwinDesk.", ["device": Device.word]))
+                            .font(.footnote).foregroundStyle(.secondary).padding(.vertical, 6)
                     }
                     Divider().overlay(TDColor.line)
                     ToggleRow(title: tr("Check automatically"), detail: tr("Looks for new releases on GitHub every few hours"),

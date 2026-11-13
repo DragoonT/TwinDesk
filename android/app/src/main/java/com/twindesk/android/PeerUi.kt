@@ -120,10 +120,12 @@ fun AndroidSection(core: Core, v: Int) {
     var looking by remember { mutableStateOf(false) }
     LaunchedEffect(looking) { if (looking) { kotlinx.coroutines.delay(1500); looking = false } }
     MacCard(tr("Phones and tablets"), action = {
+        @Suppress("UNUSED_EXPRESSION") v // capture the revision in this remembered content
         if (peer.on) TextButton(onClick = { looking = true; Thread { runCatching { core.discovery.probe() } }.start() }, enabled = !looking) {
             Text(if (looking) tr("Looking…") else tr("Refresh"), color = pal.accent, fontSize = 14.sp)
         }
     }) {
+        @Suppress("UNUSED_EXPRESSION") v // capture the revision in this remembered content
         SwitchRow(tr("Connect with Android"), if (peer.on) tr("Discoverable by nearby phones and tablets with TwinDesk") else tr("Off: hidden from other phones"), peer.on, first = true) { peer.setOn(it) }
         if (peer.on) for (f in near) {
             val isPaired = peer.isPaired(f.id)
@@ -174,9 +176,11 @@ fun PeerPage(core: Core, v: Int, tab: String) {
                 if (peer.can("fs")) row(tr("Files on {name}", "name" to name), tr("Browse its storage"), tr("Open")) { PeerActivity.open(ctx, "files") }
             }
             MacCard(tr("Shared with {name}", "name" to name)) {
+                @Suppress("UNUSED_EXPRESSION") v // capture the revision in this remembered content
                 var first = true
                 if (peer.can("clip")) { SwitchRow(tr("Clipboard"), tr("Copy on one phone, paste on the other"), peer.clipOn, first = true) { peer.setClipOn(it) }; first = false }
-                if (peer.can("notifs")) SwitchRow(tr("Notifications"), tr("Show each phone’s notifications on the other"), peer.notifsOn, first = first) { peer.setNotifsOn(it) }
+                if (peer.can("notifs")) { SwitchRow(tr("Notifications"), tr("Show each phone’s notifications on the other"), peer.notifsOn, first = first) { peer.setNotifsOn(it) }; first = false }
+                if (peer.can("sound")) SwitchRow(tr("Sound"), tr("Play audio from one device on the other."), peer.shareSound, first = first) { peer.setShareSound(it) }
             }
         }
         "Screen" -> {
@@ -185,6 +189,43 @@ fun PeerPage(core: Core, v: Int, tab: String) {
                 MacRow(tr("{name}’s screen", "name" to name), if (peer.peerOs == "ios") tr("{name} starts Share Screen in TwinDesk, then you tap View.", "name" to name) else tr("{name} is asked to start sharing when you tap View.", "name" to name), true) { PButton(tr("View"), true) { PeerScreen.view(peer, ctx) } }
                 MacRow(tr("This screen on {name}", "name" to name), tr("Android asks for confirmation before sharing this screen with {name}.", "name" to name))
             }
+            if (peer.can("sound")) MacCard(tr("Playback")) {
+                SwitchRow(tr("{name}’s sound with the screen", "name" to name), if (peer.isPlayingAudio) tr("Playing") else tr("Play audio while viewing {name}’s screen", "name" to name), peer.screenSound, first = true) { peer.setScreenSound(it) }
+            }
+            if (peer.can("sound")) MacCard(tr("Audio sharing")) {
+                SwitchRow(tr("Share sound with this screen"), tr("Allow {name} to hear audio from this device during screen share", "name" to name), peer.shareSound, first = true) { peer.setShareSound(it) }
+            }
+        }
+        "Sound" -> {
+            val me = core.store.deviceName
+            PageHead(tr("Sound"), tr("Play audio from one device on the other."))
+            MacCard {
+                DirHead(name, false, me, true)
+                SwitchRow(
+                    tr("Play {name}’s sound here", "name" to name),
+                    if (peer.isPlayingAudio) tr("Playing") else tr("Play audio from {name} on this phone", "name" to name),
+                    peer.screenSound,
+                    first = true
+                ) { peer.setScreenSound(it) }
+            }
+            MacCard {
+                DirHead(me, true, name, false)
+                val hint = when {
+                    peer.isCapturingAudio -> tr("Playing on {name}", "name" to name)
+                    peer.soundError.isNotEmpty() -> peer.soundError
+                    else -> tr("Play audio from this device on {name}", "name" to name)
+                }
+                SwitchRow(
+                    tr("Play this device’s sound on {name}", "name" to name),
+                    hint,
+                    peer.isCapturingAudio || PeerScreen.standaloneSoundActive,
+                    first = true
+                ) { on ->
+                    if (on) PeerScreen.startStandaloneSound(peer, ctx)
+                    else PeerScreen.stopStandaloneSound(peer)
+                }
+            }
+            Note(tr("Android requires screen capture permission to capture audio playback. Audio also plays on this phone."))
         }
         "Clipboard" -> {
             PageHead(tr("Clipboard"), tr("Copy on one phone and paste on the other."), peer.clipOn) { peer.setClipOn(it) }
@@ -217,11 +258,13 @@ fun PeerPage(core: Core, v: Int, tab: String) {
 // Messages, Photos, File access with a phone: theirs to open here (when it can), ours for it (when we can).
 @Composable
 private fun HubBoth(core: Core, peer: Peer, name: String, cap: String, title: String, theirs: String, ours: String, weCan: Boolean) {
+    val v = core.version.collectAsState().value
     val ctx = LocalContext.current
     val what = when (cap) { "photos" -> "media"; "fs" -> "files"; else -> cap } // Hub's names
     val open = when (cap) { "fs" -> "files"; else -> cap } // PeerActivity's
     PageHead(title, "")
     MacCard {
+        @Suppress("UNUSED_EXPRESSION") v // capture the revision in this remembered content
         var first = true
         if (peer.can(cap)) { MacRow(tr("On {name}", "name" to name), theirs, true) { PButton(tr("Open"), true) { PeerActivity.open(ctx, open) } }; first = false }
         if (weCan) {
